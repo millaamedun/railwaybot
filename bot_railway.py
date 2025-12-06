@@ -1,17 +1,20 @@
 from telethon import TelegramClient, events
 import re, os
+from telethon.sessions import StringSession
 
 api_id = int(os.getenv("API_ID"))
 api_hash = os.getenv("API_HASH")
+string_session = os.getenv("STRING_SESSION")  # از Railway میگیریم
+
+client = TelegramClient(StringSession(string_session), api_id, api_hash)
 
 SOURCE = "alizadeyazd"
 TARGET = "YousefianAbShodeh"
 
-SESSION = "railway.session"  # ← سشن مخصوص Railway
 
 pattern = re.compile(r'(فروش|خرید)\s*:\s*([\d,]+)')
 
-client = TelegramClient(SESSION, api_id, api_hash)
+client = TelegramClient(StringSession(string_session), api_id, api_hash)
 
 @client.on(events.NewMessage(chats=SOURCE))
 async def handler(event):
