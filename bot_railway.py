@@ -15,23 +15,42 @@ TARGET = "YousefianAbShodeh"
 
 pattern = re.compile(r'(فروش|خرید)\s*:\s*([\d,]+)')
 
-# برای جلوگیری از ارسال تکراری
+# جلوگیری از ارسال تکراری
 processed_ids = set()
+
+
+def detect_delta(text: str) -> int:
+    """
+    تشخیص مقدار اختلاف قیمت بر اساس نوع
+    """
+    if "مثقال" in text:
+        return 10000
+    elif "گرم" in text:
+        return 2100
+    else:
+        return 100000  # سکه و سایر موارد
 
 
 async def process_message(msg):
     text = msg.message or ""
 
-    # چک قیمت
+    # فقط پیام‌هایی که قیمت دارند
     if not pattern.search(text):
         return
+
+    delta = detect_delta(text)
 
     matches = pattern.findall(text)
     new_text = text
 
     for label, number in matches:
         clean = int(number.replace(",", ""))
-        new_price = clean - 10000 if label == "خرید" else clean + 10000
+
+        if label == "خرید":
+            new_price = clean - delta
+        else:  # فروش
+            new_price = clean + delta
+
         new_price_str = f"{new_price:,}"
 
         new_text = re.sub(
@@ -40,15 +59,14 @@ async def process_message(msg):
             new_text
         )
 
-    # حذف آیدی کانال قدیمی
+    # حذف آیدی کانال مبدا
     new_text = re.sub(r'@[\w]+', '', new_text).strip()
 
-    # افزودن آیدی خودت
+    # افزودن آیدی کانال تو
     new_text += "\n\n📌 @YousefianAbShodeh"
 
-    # ارسال
     await client.send_message(TARGET, new_text)
-    print("FORWARDED:", new_text)
+    print("FORWARDED:\n", new_text)
 
 
 async def poll():
@@ -66,11 +84,12 @@ async def poll():
         except Exception as e:
             print("Error:", e)
 
-        await asyncio.sleep(5)  # هر پنج ثانیه
+        await asyncio.sleep(5)  # هر ۵ ثانیه
 
 
 async def main():
     await client.start()
     await poll()
+
 
 asyncio.run(main())
