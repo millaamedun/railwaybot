@@ -6,14 +6,6 @@ Secrets are read from environment variables (Railway Variables).
 
 from __future__ import annotations
 
-# Railway Variables (no .env file needed):
-# API_ID, API_HASH, STRING_SESSION
-# MAHOR_PARTNER_KEY_ID, MAHOR_PARTNER_SECRET
-# Optional: TARGET, MAHOR_API_BASE_URL, PRICE_FIELD, LABEL_PERSPECTIVE,
-# MARKET_CODES, SEND_MODE, POLL_SECONDS, MIN_POST_SECONDS,
-# DEBOUNCE_SECONDS, HTTP_TIMEOUT_SECONDS, STATE_FILE
-
-
 import argparse
 import asyncio
 import logging
@@ -34,6 +26,14 @@ PRICE_PATH = "/v1/partner-api/prices"
 WS_NAMESPACE = "/partner-price-feed"
 EMPTY_BODY_SHA256 = hashlib.sha256(b"").hexdigest()
 
+GROUP_ORDER = ["coin_86", "coin_low_date", "melted_gold", "other"]
+GROUP_TITLES = {
+    "coin_86": "سکه‌های ۸۶",
+    "coin_low_date": "سکه‌های تاریخ پایین",
+    "melted_gold": "آبشده‌ها",
+    "other": "سایر نرخ‌ها",
+}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -50,6 +50,24 @@ class Settings:
     state_file: Path
     send_mode: str
     label_perspective: str = "customer"
+
+
+@dataclass(frozen=True)
+class MarketRow:
+    code: str
+    title: str
+    settlement_type: str
+    buy: Decimal | None
+    sell: Decimal | None
+    category: str
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    messages: tuple[tuple[str, str], ...]  # (group_key, message_text)
+    fingerprint: str
+    visible_markets: int
+    available_market_codes: tuple[str, ...]
 
 
 def env_float(name: str, default: str, minimum: float) -> float:
@@ -151,24 +169,34 @@ def format_price(price: Decimal) -> str:
     return f"{int(left):,}" + (f".{right}" if dot else "")
 
 
-@dataclass(frozen=True)
-class Snapshot:
-    text: str
-    fingerprint: str
-    visible_markets: int
-    available_market_codes: tuple[str, ...]
+def normalize_title_for_group(title: str) -> str:
+    return " ".join(title.replace("ي", "ی").replace("ك", "ک").split())
 
 
-def make_snapshot(payload: Any, settings: Settings) -> Snapshot:
+def classify_group(row: MarketRow) -> str:
+    title = normalize_title_for_group(row.title)
+    if row.category == "MELTED_GOLD" or "آبشده" in title:
+        return "melted_gold"
+    if "تاریخ پایین" in title:
+        return "coin_low_date"
+    if "86" in title or "۸۶" in title or "سکه" in title:
+        return "coin_86"
+    return "other"
+
+
+def settlement_sort_key(settlement_type: str) -> int:
+    return {"SPOT": 0, "TOMORROW": 1, "DAY_AFTER_TOMORROW": 2}.get(settlement_type, 3)
+
+
+def parse_market_rows(payload: Any, settings: Settings) -> tuple[list[MarketRow], tuple[str, ...]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
         raise ValueError("Invalid Mahor API response (items missing)")
     items = payload["items"]
     if not items:
-        # In an outage, an empty list must never overwrite the last published rate.
         raise ValueError("Mahor returned an empty markets list; not publishing")
 
     seen_markets: set[str] = set()
-    parsed: list[tuple[str, str, str, Decimal | None, Decimal | None]] = []
+    parsed: list[MarketRow] = []
     codes_available: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
@@ -185,12 +213,11 @@ def make_snapshot(payload: Any, settings: Settings) -> Snapshot:
         codes_available.add(code)
         if settings.market_codes and code not in settings.market_codes:
             continue
-        # One instrument may have SPOT, TOMORROW and DAY_AFTER_TOMORROW markets.
-        # Never deduplicate by instrument code alone.
         market_identity = str(item.get("marketId") or f"{code}/{settlement_type}")
         if market_identity in seen_markets:
             raise ValueError(f"Duplicate market entry {market_identity}")
         seen_markets.add(market_identity)
+
         if category == "MELTED_GOLD":
             title = {
                 "SPOT": "آبشده نقد حاضر",
@@ -201,56 +228,70 @@ def make_snapshot(payload: Any, settings: Settings) -> Snapshot:
             suffix = "فردا" if settlement_type == "TOMORROW" else "پس‌فردا"
             if suffix not in title:
                 title = f"{title} ({suffix})"
-        buysell = []
+
+        side_prices: list[Decimal | None] = []
         for side_name in ("buy", "sell"):
             side = item.get(side_name)
             if not isinstance(side, dict):
                 raise ValueError(f"Missing side {side_name} for {code}")
-            # The API can return stale last prices for disabled sides. Never publish those.
             price = None
             if side.get("enabled") is True:
                 price = parse_positive_price(side.get(settings.price_field))
                 if price is None:
-                    # A broken enabled quote is NOT a market-closure event.
-                    # Keep last good post rather than posting a misleading status.
                     raise ValueError(f"Invalid enabled {settings.price_field} price for {code}/{side_name}")
-            buysell.append(price)
-        buy, sell = buysell
+            side_prices.append(price)
+        buy, sell = side_prices
         if buy is not None or sell is not None:
-            parsed.append((code, title, settlement_type, buy, sell))
+            parsed.append(MarketRow(code=code, title=title, settlement_type=settlement_type, buy=buy, sell=sell, category=category))
 
-    if settings.market_codes and not (settings.market_codes & codes_available):
-        raise ValueError(
-            "No matching MARKET_CODES. Available: " + ", ".join(sorted(codes_available))
-        )
-    settle_rank = {"TOMORROW": 0, "DAY_AFTER_TOMORROW": 1, "SPOT": 2}
-    parsed.sort(key=lambda x: (x[0], settle_rank.get(x[2], 3), x[1]))
+    if settings.market_codes and not (settings.market_codes & set(codes_available)):
+        raise ValueError("No matching MARKET_CODES. Available: " + ", ".join(sorted(codes_available)))
 
-    text_lines = ["🟢 نرخ‌های ماهور" if parsed else "🔴 وضعیت نرخ‌های ماهور", ""]
-    for _code, title, _settlement, buy, sell in parsed:
-        text_lines.append(f"🔸 {title}")
-        # BUY=customer buys, SELL=customer sells. "dealer" reverses labels
-        # to dealer's side while retaining the exact Mahor prices.
+    parsed.sort(key=lambda x: (GROUP_ORDER.index(classify_group(x)) if classify_group(x) in GROUP_ORDER else 999, settlement_sort_key(x.settlement_type), x.code, x.title))
+    return parsed, tuple(sorted(codes_available))
+
+
+def build_group_message(group_key: str, rows: list[MarketRow], settings: Settings) -> str:
+    lines: list[str] = [f"🟢 {GROUP_TITLES[group_key]}", ""]
+    for row in rows:
+        lines.append(row.title)
         if settings.label_perspective == "customer":
-            sell_label_price, buy_label_price = sell, buy
+            sell_label_price, buy_label_price = row.sell, row.buy
         else:
-            sell_label_price, buy_label_price = buy, sell
+            sell_label_price, buy_label_price = row.buy, row.sell
         if sell_label_price is not None:
-            text_lines.append(f"فروش: {format_price(sell_label_price)}")
+            lines.append(f"🔴 فروش: {format_price(sell_label_price)}")
         if buy_label_price is not None:
-            text_lines.append(f"خرید: {format_price(buy_label_price)}")
-        text_lines.append("")
-    if not parsed:
-        text_lines.extend(["⛔ در حال حاضر نرخ فعال برای انتشار وجود ندارد.", ""])
-    text_lines.extend(["📌 @" + settings.target.lstrip("@")])
-    content = "\n".join(text_lines).strip()
-    if len(content) > 3900:
-        raise ValueError("Telegram message too long; filter markets with MARKET_CODES")
+            lines.append(f"🟢 خرید: {format_price(buy_label_price)}")
+        lines.append("")
+    lines.extend(["📌 @" + settings.target.lstrip("@")])
+    text = "\n".join(lines).strip()
+    if len(text) > 3900:
+        raise ValueError(f"Telegram message too long in group {group_key}; filter markets with MARKET_CODES")
+    return text
+
+
+def make_snapshot(payload: Any, settings: Settings) -> Snapshot:
+    rows, available_codes = parse_market_rows(payload, settings)
+    grouped: dict[str, list[MarketRow]] = {k: [] for k in GROUP_ORDER}
+    for row in rows:
+        grouped[classify_group(row)].append(row)
+
+    messages: list[tuple[str, str]] = []
+    for key in GROUP_ORDER:
+        if grouped[key]:
+            messages.append((key, build_group_message(key, grouped[key], settings)))
+
+    if not messages:
+        content = "🔴 وضعیت نرخ‌های ماهور\n\n⛔ در حال حاضر نرخ فعال برای انتشار وجود ندارد.\n\n📌 @" + settings.target.lstrip("@")
+        messages.append(("empty", content))
+
+    fingerprint_source = "\n\n=====GROUP=====".join([f"{k}\n{text}" for k, text in messages])
     return Snapshot(
-        text=content,
-        fingerprint=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        visible_markets=len(parsed),
-        available_market_codes=tuple(sorted(codes_available)),
+        messages=tuple(messages),
+        fingerprint=hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
+        visible_markets=len(rows),
+        available_market_codes=available_codes,
     )
 
 
@@ -272,8 +313,6 @@ def write_state(path: Path, state: dict[str, Any]) -> None:
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
-
-# ================== TELEGRAM PUBLISHING / SYNC ==================
 
 LOG = logging.getLogger("mahor_telegram")
 
@@ -298,8 +337,10 @@ class Publisher:
         snapshot = make_snapshot(feed, self.settings)
         if self.dry_run:
             print("\n--- MAHOR PREVIEW (NOT SENT) ---\n")
-            print(snapshot.text)
-            print("\n--- END PREVIEW ---\n")
+            for idx, (group_key, text) in enumerate(snapshot.messages, start=1):
+                print(f"[MESSAGE {idx} - {group_key}]\n")
+                print(text)
+                print("\n-----------------------------\n")
             print("Available MARKET_CODES:", ", ".join(snapshot.available_market_codes))
             return False
         if self.state.get("fingerprint") == snapshot.fingerprint:
@@ -309,43 +350,46 @@ class Publisher:
         delay = self.settings.min_post_seconds - (time.time() - last_sent)
         if delay > 0:
             await asyncio.sleep(delay)
-            # A newer snapshot may already exist. Fetch latest right before sending.
             snapshot = make_snapshot(await fetch_prices(self.http, self.settings), self.settings)
             if self.state.get("fingerprint") == snapshot.fingerprint:
                 return False
 
         from telethon.errors import FloodWaitError, MessageIdInvalidError
         try:
-            message_id = await self._send(snapshot.text, MessageIdInvalidError)
+            sent_message_ids = await self._send_messages(snapshot.messages, MessageIdInvalidError)
         except FloodWaitError as exc:
             LOG.warning("Telegram FloodWait: sleeping %d seconds", exc.seconds)
             await asyncio.sleep(exc.seconds + 1)
-            # Re-query authoritative prices after backoff, then retry at most once.
             snapshot = make_snapshot(await fetch_prices(self.http, self.settings), self.settings)
             if self.state.get("fingerprint") == snapshot.fingerprint:
                 return False
-            message_id = await self._send(snapshot.text, MessageIdInvalidError)
+            sent_message_ids = await self._send_messages(snapshot.messages, MessageIdInvalidError)
 
         self.state = {
             "fingerprint": snapshot.fingerprint,
-            "message_id": message_id,
+            "message_ids": sent_message_ids,
             "sent_at": time.time(),
         }
         write_state(self.settings.state_file, self.state)
-        LOG.info("Published %d markets, message_id=%s", snapshot.visible_markets, message_id)
+        LOG.info("Published %d markets in %d messages", snapshot.visible_markets, len(snapshot.messages))
         return True
 
-    async def _send(self, text: str, invalid_id_exception: type[Exception]) -> int:
-        if self.settings.send_mode == "edit" and self.state.get("message_id"):
-            try:
-                msg = await self.telegram.edit_message(
-                    self.settings.target, int(self.state["message_id"]), text
-                )
-                return int(msg.id)
-            except invalid_id_exception:
-                LOG.warning("Previous message unavailable; publishing a new one")
-        msg = await self.telegram.send_message(self.settings.target, text, link_preview=False)
-        return int(msg.id)
+    async def _send_messages(self, messages: tuple[tuple[str, str], ...], invalid_id_exception: type[Exception]) -> dict[str, int]:
+        sent: dict[str, int] = {}
+        old_ids = self.state.get("message_ids") if isinstance(self.state.get("message_ids"), dict) else {}
+
+        for group_key, text in messages:
+            if self.settings.send_mode == "edit" and group_key in old_ids:
+                try:
+                    msg = await self.telegram.edit_message(self.settings.target, int(old_ids[group_key]), text)
+                    sent[group_key] = int(msg.id)
+                    continue
+                except invalid_id_exception:
+                    LOG.warning("Previous message for %s unavailable; publishing a new one", group_key)
+            msg = await self.telegram.send_message(self.settings.target, text, link_preview=False)
+            sent[group_key] = int(msg.id)
+            await asyncio.sleep(0.6)
+        return sent
 
 
 async def periodic_refresh(event: asyncio.Event, poll_seconds: float) -> None:
@@ -355,9 +399,7 @@ async def periodic_refresh(event: asyncio.Event, poll_seconds: float) -> None:
 
 
 async def websocket_listener(settings: Settings, event: asyncio.Event) -> None:
-    """Reconnect with a NEW nonce/timestamp; auth nonces must never be reused."""
     import socketio
-
     while True:
         sio = socketio.AsyncClient(reconnection=False, logger=False, engineio_logger=False)
 
@@ -378,7 +420,7 @@ async def websocket_listener(settings: Settings, event: asyncio.Event) -> None:
                 wait_timeout=10,
             )
             LOG.info("Mahor realtime websocket connected")
-            event.set()  # reconcile updates missed while disconnected
+            event.set()
             await sio.wait()
         except asyncio.CancelledError:
             raise
@@ -394,13 +436,12 @@ async def websocket_listener(settings: Settings, event: asyncio.Event) -> None:
 
 
 async def run_worker(publisher: Publisher, event: asyncio.Event) -> None:
-    event.set()  # initial snapshot
+    event.set()
     while True:
         await event.wait()
         event.clear()
         if publisher.settings.debounce_seconds:
             await asyncio.sleep(publisher.settings.debounce_seconds)
-        # Collapse bursts of websocket events into one authoritative REST fetch.
         event.clear()
         try:
             await publisher.sync()
@@ -464,10 +505,6 @@ def main() -> None:
         asyncio.run(run(once=args.once, check=args.check))
     except KeyboardInterrupt:
         LOG.info("Stopped")
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
