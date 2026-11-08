@@ -1,3 +1,4 @@
+# Railway: use Docker instead of Railpack/mise.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -6,11 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-
-# Install the bot's dependencies explicitly and verify they can be imported.
-# The explicit names also protect against an outdated requirements.txt in GitHub.
-RUN python -m pip install --no-cache-dir -r requirements.txt \
+# Install the precise runtime dependencies directly so an old/pinned
+# requirements.txt in GitHub cannot conflict with the bot's dependencies.
+RUN python -m pip install --no-cache-dir \
     'Telethon>=1.35,<2' \
     'httpx>=0.27,<1' \
     'python-socketio[asyncio_client]>=5.11,<6' \
