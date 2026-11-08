@@ -1,106 +1,96 @@
-import os
-import re
+"""
+Mahor -> YousefianAbShodeh Telegram publisher.
+All executable bot code lives in this ONE bot.py file.
+Secrets are read from environment variables (Railway Variables).
+"""
+
+from __future__ import annotations
+
+# Railway Variables (no .env file needed):
+# API_ID, API_HASH, STRING_SESSION
+# MAHOR_PARTNER_KEY_ID, MAHOR_PARTNER_SECRET
+# Optional: TARGET, MAHOR_API_BASE_URL, PRICE_FIELD, LABEL_PERSPECTIVE,
+# MARKET_CODES, SEND_MODE, POLL_SECONDS, MIN_POST_SECONDS,
+# DEBOUNCE_SECONDS, HTTP_TIMEOUT_SECONDS, STATE_FILE
+
+
+import argparse
 import asyncio
-from telethon import TelegramClient
-from telethon.sessions import StringSession
+import logging
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
 
-api_id = int(os.getenv("API_ID"))
-api_hash = os.getenv("API_HASH")
-string_session = os.getenv("STRING_SESSION")
+import httpx
 
-client = TelegramClient(StringSession(string_session), api_id, api_hash)
-
-SOURCE = "alizadeyazd"
-TARGET = "YousefianAbShodeh"
-
-price_pattern = re.compile(r'(فروش|خرید)\s*:\s*([\d,]+)')
-
-processed_ids = set()
-
-
-async def process_message(msg):
-    text = msg.message or ""
-
-    if not price_pattern.search(text):
-        return
-
-    lines = text.splitlines()
-    new_lines = []
-
-    # آیا پیام شامل مثقال یا گرم هست؟
-    has_mesghal_or_gram = ("مثقال" in text) or ("گرم" in text)
-
-    current_section = None
-
-    for line in lines:
-        # تشخیص سکشن
-        if "مثقال" in line:
-            current_section = "mesghal"
-        elif "گرم" in line:
-            current_section = "gram"
-
-        match = price_pattern.search(line)
-        if match:
-            label, number = match.groups()
-            clean = int(number.replace(",", ""))
-
-            # تعیین delta
-            if has_mesghal_or_gram:
-                if current_section == "mesghal":
-                    delta = 10000
-                elif current_section == "gram":
-                    delta = 2100
-                else:
-                    # قیمت‌هایی که زیر سکشن نامشخصن دست نخورده می‌مونن
-                    new_lines.append(line)
-                    continue
-            else:
-                # پیام سکه
-                delta = 100000
-
-            new_price = clean - delta if label == "خرید" else clean + delta
-            new_price_str = f"{new_price:,}"
-
-            line = re.sub(
-                price_pattern,
-                f"{label} : {new_price_str}",
-                line
-            )
-
-        new_lines.append(line)
-
-    new_text = "\n".join(new_lines)
-
-    # حذف آیدی مبدا
-    new_text = re.sub(r'@[\w]+', '', new_text).strip()
-
-    # افزودن آیدی خودت
-    new_text += "\n\n📌 @YousefianAbShodeh"
-
-    await client.send_message(TARGET, new_text)
-    print("FORWARDED:\n", new_text)
+PRICE_PATH = "/v1/partner-api/prices"
+WS_NAMESPACE = "/partner-price-feed"
+EMPTY_BODY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
-async def poll():
-    print("Polling bot started…")
+@dataclass(frozen=True)
+class Settings:
+    base_url: str
+    key_id: str
+    secret: str
+    target: str
+    market_codes: frozenset[str]
+    price_field: str
+    poll_seconds: float
+    min_post_seconds: float
+    debounce_seconds: float
+    timeout_seconds: float
+    state_file: Path
+    send_mode: str
+    label_perspective: str = "customer"
 
-    while True:
-        try:
-            messages = await client.get_messages(SOURCE, limit=5)
 
-            for msg in reversed(messages):
-                if msg.id not in processed_ids:
-                    processed_ids.add(msg.id)
-                    await process_message(msg)
-
-        except Exception as e:
-            print("Error:", e)
-
-        await asyncio.sleep(5)
+def env_float(name: str, default: str, minimum: float) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not minimum <= value < float("inf"):
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
 
 
-async def main():
-    await client.start()
-    await poll()
-
-asyncio.run(main())
+def read_settings() -> Settings:
+    base_url = os.getenv("MAHOR_API_BASE_URL", "https://api.goldmahor.ir").strip().rstrip("/")
+    if not base_url.startswith("https://") or "?" in base_url or "#" in base_url:
+        raise ValueError("MAHOR_API_BASE_URL must be an HTTPS origin (without path/query)")
+    key_id = os.getenv("MAHOR_PARTNER_KEY_ID", "").strip()
+    secret = os.getenv("MAHOR_PARTNER_SECRET", "").strip()
+    if not key_id or not secret:
+        raise ValueError("Set MAHOR_PARTNER_KEY_ID and MAHOR_PARTNER_SECRET in Railway Variables")
+    target = os.getenv("TARGET", "@YousefianAbShodeh").strip()
+    if not target:
+        raise ValueError("TARGET is empty")
+    market_codes = frozenset(
+        code.strip().upper()
+        for code in os.getenv("MARKET_CODES", "").split(",")
+        if code.strip()
+    )
+    price_field = os.getenv("PRICE_FIELD", "basePrice").strip()
+    if price_field not in {"basePrice", "price"}:
+        raise ValueError("PRICE_FIELD must be basePrice or price")
+    send_mode = os.getenv("SEND_MODE", "new").lower().strip()
+    if send_mode not in {"new", "edit"}:
+        raise ValueError("SEND_MODE must be new or edit")
+    label_perspective = os.getenv("LABEL_PERSPECTIVE", "customer").lower().strip()
+    if label_perspective not in {"customer", "dealer"}:
+        raise ValueError("LABEL_PERSPECTIVE must be customer or dealer")
+    return Settings(
+        base_url=base_url,
+        key_id=key_id,
+        secret=secret,
+        target=target,
+        market_codes=market_codes,
+        price_field=price_field,
