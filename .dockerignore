@@ -1,7 +1,5 @@
-.git
-.env
-*.session
-*.session-journal
-state.json
 __pycache__/
 .pytest_cache/
+*.pyc
+.DS_Store
+state.json
