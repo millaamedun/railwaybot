@@ -252,17 +252,17 @@ def parse_market_rows(payload: Any, settings: Settings) -> tuple[list[MarketRow]
 
 
 def build_group_message(group_key: str, rows: list[MarketRow], settings: Settings) -> str:
-    lines: list[str] = [f"🟢 {GROUP_TITLES[group_key]}", ""]
+    # lines: list[str] = [f"🟢 {GROUP_TITLES[group_key]}", ""]
     for row in rows:
         lines.append(row.title)
         if settings.label_perspective == "customer":
             sell_label_price, buy_label_price = row.sell, row.buy
         else:
             sell_label_price, buy_label_price = row.buy, row.sell
-        if sell_label_price is not None:
-            lines.append(f"🔴 فروش: {format_price(sell_label_price)}")
         if buy_label_price is not None:
             lines.append(f"🟢 خرید: {format_price(buy_label_price)}")
+        if sell_label_price is not None:
+            lines.append(f"🔴 فروش: {format_price(sell_label_price)}")
         lines.append("")
     lines.extend(["📌 @" + settings.target.lstrip("@")])
     text = "\n".join(lines).strip()
