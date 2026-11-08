@@ -9,6 +9,6 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY bot_railway.py ./
+COPY bot.py ./
 
-CMD ["python", "bot_railway.py"]
+CMD ["python", "bot.py"]
