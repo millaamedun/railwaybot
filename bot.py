@@ -284,9 +284,9 @@ def make_snapshot(payload: Any, settings: Settings) -> Snapshot:
         if grouped[key]:
             messages.append((key, build_group_message(key, grouped[key], settings)))
 
-    if not messages:
-        content = "🔴 وضعیت نرخ‌های ماهور\n\n⛔ در حال حاضر نرخ فعال برای انتشار وجود ندارد.\n\n📌 @" + settings.target.lstrip("@")
-        messages.append(("empty", content))
+    # When Mahor closes all markets (e.g. overnight), publish NOTHING.
+    # Keep the last valid market snapshot in state instead of posting a status message.
+    # An empty messages tuple is handled as a no-op in Publisher.sync().
 
     fingerprint_source = "\n\n=====GROUP=====".join([f"{k}\n{text}" for k, text in messages])
     return Snapshot(
@@ -337,6 +337,12 @@ class Publisher:
     async def sync(self) -> bool:
         feed = await fetch_prices(self.http, self.settings)
         snapshot = make_snapshot(feed, self.settings)
+        if not snapshot.messages:
+            if self.dry_run:
+                print("Mahor has no active prices; no Telegram message would be sent.")
+            else:
+                LOG.info("Mahor markets closed: no message sent; previous state retained")
+            return False
         if self.dry_run:
             print("\n--- MAHOR PREVIEW (NOT SENT) ---\n")
             for idx, (group_key, text) in enumerate(snapshot.messages, start=1):
@@ -353,6 +359,9 @@ class Publisher:
         if delay > 0:
             await asyncio.sleep(delay)
             snapshot = make_snapshot(await fetch_prices(self.http, self.settings), self.settings)
+            if not snapshot.messages:
+                LOG.info("Mahor markets closed while waiting: no message sent")
+                return False
             if self.state.get("fingerprint") == snapshot.fingerprint:
                 return False
 
@@ -363,6 +372,9 @@ class Publisher:
             LOG.warning("Telegram FloodWait: sleeping %d seconds", exc.seconds)
             await asyncio.sleep(exc.seconds + 1)
             snapshot = make_snapshot(await fetch_prices(self.http, self.settings), self.settings)
+            if not snapshot.messages:
+                LOG.info("Mahor markets closed while waiting: no message sent")
+                return False
             if self.state.get("fingerprint") == snapshot.fingerprint:
                 return False
             sent_message_ids = await self._send_messages(snapshot.messages, MessageIdInvalidError)
@@ -510,7 +522,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
-
-
     main()
