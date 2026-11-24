@@ -40,7 +40,7 @@ from typing import Any
 
 import httpx
 
-LOG = logging.getLogger("mahor-farda-buy")
+LOG = logging.getLogger("mahor-farda-sell")
 PRICE_PATH = "/v1/partner-api/prices"
 WS_NAMESPACE = "/partner-price-feed"
 APP_URL = "https://goldmahor.ir"
@@ -193,7 +193,7 @@ def find_farda_sell(feed: Any, config: Config) -> tuple[Quote | None, str | None
 
     market, code = matches[0]
     market_id = str(market.get("marketId") or "").strip()
-    side = market.get("sell")
+    side = market.get("buy")
     if not isinstance(side, dict):
         raise ValueError("Missing SELL side for tomorrow melted-gold market")
     if side.get("enabled") is not True:
