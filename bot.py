@@ -40,7 +40,7 @@ from typing import Any
 
 import httpx
 
-LOG = logging.getLogger("mahor-farda-sell")
+LOG = logging.getLogger("mahor-farda-buy")
 PRICE_PATH = "/v1/partner-api/prices"
 WS_NAMESPACE = "/partner-price-feed"
 APP_URL = "https://goldmahor.ir"
